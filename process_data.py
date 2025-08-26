@@ -4,7 +4,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from astropy.stats import sigma_clip
 import itertools
-from process_transit import get_transit_bounds_external, get_transit_bounds_internal
+from .process_transit import get_transit_bounds_external, get_transit_bounds_internal
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 import warnings
