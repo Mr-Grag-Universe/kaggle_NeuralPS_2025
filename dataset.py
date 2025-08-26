@@ -258,3 +258,19 @@ def preprocessed_collate_fn(batch):
         'planet_id': [item['planet_id'] for item in batch],
         'observation_index': [item['observation_index'] for item in batch]
     }
+
+def split_dataset(dataset, val_fraction=0.2, seed=42):
+    """
+    Return (train_dataset, val_dataset) as torch.utils.data.Subset objects.
+    """
+    from torch.utils.data import Subset
+    import torch
+    import math
+    num_samples = len(dataset)
+    indices = torch.randperm(num_samples, generator=torch.Generator().manual_seed(seed)).tolist()
+    val_size = int(math.ceil(val_fraction * num_samples))
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
