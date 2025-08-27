@@ -14,6 +14,7 @@ class PlanetDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.adc_info = pd.read_csv(root_dir.parent/'adc_info.csv')
         self.train_labels = pd.read_csv(root_dir.parent/'train.csv')
+        self.axis_info = pd.read_parquet(root_dir / 'axis_info.parquet')
         
         # Получаем список планет (папок с индексами)
         self.planet_folders = [
@@ -81,6 +82,8 @@ class PlanetDataset(Dataset):
         dead = pd.read_parquet(calibration_dir / 'dead.parquet').values
         linear_corr = pd.read_parquet(calibration_dir / 'linear_corr.parquet').values.reshape(6, 32, -1)
         flat = pd.read_parquet(calibration_dir / 'flat.parquet').values
+        dt = self.axis_info['AIRS-CH0-integration_time'].dropna().values
+        dt[1::2] += 0.1
         
         # adc_offset_fgs1 = self.adc_info['FGS1_adc_offset'].values[0]
         adc_offset_airs = self.adc_info['AIRS-CH0_adc_offset'].values[0]
@@ -88,7 +91,7 @@ class PlanetDataset(Dataset):
         adc_gain_airs = self.adc_info['AIRS-CH0_adc_gain'].values[0]
 
         cds_signal = prepare_signal(signal_airs, 
-                                    dead, dark, linear_corr=None, flat=flat,
+                                    dead, dark, linear_corr=None, dt=dt, flat=flat,
                                     gain=adc_gain_airs, offset=adc_offset_airs,
                                     binning=30,
                                     calibrate=True)        # l, r = get_transit_bounds(cds_signal.mean(axis=(1,2)))
