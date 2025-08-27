@@ -14,7 +14,7 @@ class PlanetDataset(Dataset):
         self.root_dir = Path(root_dir)
         self.adc_info = pd.read_csv(root_dir.parent/'adc_info.csv')
         self.train_labels = pd.read_csv(root_dir.parent/'train.csv')
-        self.axis_info = pd.read_parquet(root_dir / 'axis_info.parquet')
+        self.axis_info = pd.read_parquet(root_dir.parent / 'axis_info.parquet')
         
         # Получаем список планет (папок с индексами)
         self.planet_folders = [
