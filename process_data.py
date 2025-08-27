@@ -18,7 +18,7 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 
 
-def calibrate_signal(signal, dead, dark, flat, linear_corr=None):
+def calibrate_signal(signal, dead, dark, flat, dt, linear_corr=None):
     def mask_pixels(signal, dead, dark):
         hot = sigma_clip(dark, sigma=5, maxiters=3).mask
         hot_mask = np.tile(hot, (signal.shape[0], 1, 1))
@@ -49,9 +49,11 @@ def calibrate_signal(signal, dead, dark, flat, linear_corr=None):
     signal = mask_pixels(signal, dead, dark)
     if linear_corr is not None:
         signal = apply_linear_corr(signal, linear_corr)
+    signal = clean_dark(signal, dead, dark, dt)
     signal = correct_flat_field(signal, flat, dead)
     
     return signal
+
 
 def get_prepared_cds(signal, binning):
     def get_cds(signal):
@@ -71,7 +73,8 @@ def get_prepared_cds(signal, binning):
 
 def prepare_signal(signal : np.ndarray,
                    dead=None, dark=None, 
-                   linear_corr=None, 
+                   linear_corr=None,
+                   dt=None,
                    flat=None, 
                    gain=None, offset=None,
                    binning=30,
@@ -81,8 +84,8 @@ def prepare_signal(signal : np.ndarray,
 
     signal = signal.astype(np.float64)
     signal = restore(signal, gain, offset)
-    signal = calibrate_signal(signal, dead, dark, 
-                              flat, linear_corr=linear_corr) if calibrate else signal
+    signal = calibrate_signal(signal, dead, dark, dt=dt,
+                              flat=flat, linear_corr=linear_corr) if calibrate else signal
     cds = get_prepared_cds(signal, binning=binning)
 
     return cds
