@@ -7,7 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import numpy as np
-from .process_data import prepare_signal
+from .process_data import prepare_signal, get_target, get_noise
 
 class PlanetDataset(Dataset):
     def __init__(self, root_dir):
@@ -61,10 +61,13 @@ class PlanetDataset(Dataset):
         
         return {
             'signal': signal,
+            'noise' : get_noise(signal, labels[1:]),
+            'noisy_target' : get_target(signal),
+            'target': labels,
+
             'path': observation['path'],
             'planet_id': observation['planet_id'],
-            'observation_index': observation['observation_index'],
-            'target': labels
+            'observation_index': observation['observation_index']
         }
 
     def get_signal(self, observation):
@@ -184,22 +187,29 @@ def save_preprocessed_data(dataset, save_dir):
     Сохраняет предобработанные данные в виде тензоров
     """
     save_dir = Path(save_dir)
-    signals_dir = save_dir / 'signals'
-    targets_dir = save_dir / 'targets'
-    signals_dir.mkdir(parents=True, exist_ok=True)
-    targets_dir.mkdir(parents=True, exist_ok=True)
+    signals_dir       = save_dir / 'signals'
+    noises_dir        = save_dir / 'noises'
+    noisy_targets_dir = save_dir / 'noisy_targets'
+    targets_dir       = save_dir / 'targets'
+    # create directories for files
+    for directory in [signals_dir, noises_dir, noisy_targets_dir, targets_dir]:
+        directory.mkdir(parents=True, exist_ok=True)
+    dirs = {'signal'        : signals_dir, 
+            'noise'         : noises_dir, 
+            'noisy_target' : noisy_targets_dir, 
+            'targets_dir'   : targets_dir}
     
     metadata = []
     
-    for idx in tqdm(range(200)): # len(dataset))):
+    for idx in tqdm(range(len(dataset))):
         item = dataset[idx]
-        signal = item['signal']
-        target = item['target']
         
         # Сохраняем сигнал (4D тензор)
-        torch.save(signal, signals_dir / f"{idx}.pt")
-        
+        for key in item:
+            if key in ['signal', 'noise', 'noisy_target']:
+                torch.save(item[key], dirs[key] / f"{idx}.pt")
         # Сохраняем target если он есть
+        target = item['target']
         if target is not None:
             torch.save(torch.tensor(target), targets_dir / f"{idx}.pt")
         
@@ -227,25 +237,24 @@ class PreprocessedPlanetDataset(Dataset):
         row = self.metadata.iloc[idx]
         
         # Загружаем сигнал
-        signal = torch.load(self.data_dir / 'signals' / f"{row['index']}.pt", 
-                            weights_only=False)
-        
+        res = {}
+        for key in ['signal', 'noise', 'noisy_target']:
+            res[key] = torch.load(self.data_dir / f'{key}s' / f"{row['index']}.pt", weights_only=False)
         # Загружаем target если он есть
         target = None
         if row['has_target']:
-            target = torch.load(self.data_dir / 'targets' / f"{row['index']}.pt", 
-                                weights_only=False)
+            res['target'] = torch.load(self.data_dir / 'targets' / f"{row['index']}.pt", 
+                                     weights_only=False)
+        res['planet_id']         = row['planet_id']
+        res['observation_index'] = row['observation_index']
         
-        return {
-            'signal': signal,  # 4D тензор
-            'target': target,  # 2D тензор или None
-            'planet_id': row['planet_id'],
-            'observation_index': row['observation_index']
-        }
+        return res
 
 # Создайте соответствующий collate_fn
 def preprocessed_collate_fn(batch):
-    signals = torch.stack([torch.tensor(item['signal']) for item in batch])
+    signals       = torch.stack([torch.tensor(item['signal'      ]) for item in batch])
+    noises        = torch.stack([torch.tensor(item['noise'       ]) for item in batch])
+    noisy_targets = torch.stack([torch.tensor(item['noisy_target']) for item in batch])
     targets = [item['target'] for item in batch]
     
     # Фильтруем None targets
@@ -256,8 +265,10 @@ def preprocessed_collate_fn(batch):
         targets = None
     
     return {
-        'signal': signals,
-        'target': targets,
+        'signal'      : signals,
+        'noise'       : noises,
+        'noisy_target': noisy_targets,
+        'target'      : targets,
         'planet_id': [item['planet_id'] for item in batch],
         'observation_index': [item['observation_index'] for item in batch]
     }
