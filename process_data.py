@@ -501,127 +501,132 @@ class FluxDriftGP(ExactGP):
 
 def get_flux_drift_ratio_gpytorch(flux_t: torch.Tensor) -> torch.Tensor:
     """
-    Батчевая версия get_flux_drift_ratio с использованием GPyTorch
-    flux_t: torch.Tensor shape (B, T) где B - размер батча, T - временные точки
-    возвращает: torch.Tensor shape (B, T)
+    Батчевая версия get_flux_drift_ratio, упрощённая и ускоренная:
+    - пытается обучить GP быстро (короткий цикл), при ошибке использует скользящее среднее (fallback),
+    - возвращает drift_ratio shape (B, T).
     """
     assert flux_t.dim() >= 2, "flux_t must be (B, T) or more"
     B, T = flux_t.shape
     device = flux_t.device
     dtype = flux_t.dtype
-    
-    # Создаем временную ось
+
+    # временная ось (shared)
     x = torch.linspace(0.0, 1.0, T, device=device, dtype=dtype).unsqueeze(0).expand(B, -1)
-    
-    # Определяем маску для тренировочных данных (вне транзита)
+
+    # определяем bounds и train_mask пакетно (в цикле, т.к. _get_transit_bounds_torch может быть скалярной)
     bounds = [_get_transit_bounds_torch(flux_t[i]) for i in range(B)]
     train_mask = torch.ones((B, T), device=device, dtype=torch.bool)
-    
     for i in range(B):
         l, r = bounds[i]
         li = int(max(0, np.floor(l)))
         ri = int(min(T, np.ceil(r)))
         if ri > li:
             train_mask[i, li:ri] = False
-    
-    # Предварительная подготовка выхода
+
     drift = torch.zeros_like(flux_t, dtype=dtype, device=device)
-    
+
+    # Параметры fallback-сглаживания (скользящее среднее / адаптивное окно)
+    def rolling_avg_1d(y: torch.Tensor, k: int):
+        # y: (T,)
+        pad = k // 2
+        y_pad = F.pad(y.unsqueeze(0).unsqueeze(0), (pad, pad), mode='reflect').squeeze()
+        sm = F.avg_pool1d(y_pad.unsqueeze(0).unsqueeze(0), kernel_size=k, stride=1).squeeze()
+        # если длина изменилась (редко), интерполируем
+        if sm.numel() != T:
+            sm = F.interpolate(sm.unsqueeze(0).unsqueeze(0), size=T, mode='linear', align_corners=False).squeeze()
+        return sm
+
+    # Определяем оптимизированные параметры для GP-попытки
+    gp_max_iter = 40           # короткий цикл, чтобы ускорить
+    gp_lr = 0.05
+    min_train_points = 3
+
     for i in range(B):
-        # Тренировочные данные для этого элемента батча
         train_x_i = x[i, train_mask[i]].reshape(-1, 1)
         train_y_i = flux_t[i, train_mask[i]]
-        
-        if train_x_i.shape[0] < 2:
-            mean_val = float(train_y_i.mean().item()) if train_y_i.numel() > 0 else float(flux_t[i].mean().item())
-            drift[i, :] = torch.full((T,), mean_val, device=device, dtype=dtype)
+
+        # Если мало тренировочных точек — fallback: константа (среднее) или скользящее среднее по полной кривой
+        if train_x_i.shape[0] < min_train_points:
+            # fallback: скользящее среднее на всей кривой с малым окном
+            k = max(3, min(9, (T // 20) | 1))
+            drift[i, :] = rolling_avg_1d(flux_t[i], k)
             continue
-            
-        # Инициализируем likelihood и модель
-        likelihood = GaussianLikelihood().to(device)
-        model = FluxDriftGP(train_x_i.to(device=device, dtype=dtype), 
-                            train_y_i.to(device=device, dtype=dtype), 
-                            likelihood).to(device)
-        
-        # Переводим модель в режим обучения
-        model.train()
-        likelihood.train()
-        
-        # Используем LBFGS оптимизатор
-        # optimizer = torch.optim.Adam(list(model.parameters()) + list(likelihood.parameters()), lr=1e-2)
-        optimizer = torch.optim.LBFGS(list(model.parameters()) + list(likelihood.parameters()),
-                                      max_iter=20, line_search_fn='strong_wolfe')
-        mll = ExactMarginalLogLikelihood(likelihood, model)
 
-        # Сохраняем резервную копию параметров
-        state_model_before = copy.deepcopy(model.state_dict())
-        state_lik_before = copy.deepcopy(likelihood.state_dict())
+        # Нормируем train_y для стабильности GP
+        y_mean = float(train_y_i.mean().item())
+        y_std = float(train_y_i.std().item())
+        if y_std < 1e-8:
+            # практически константа
+            drift[i, :] = torch.full((T,), y_mean, device=device, dtype=dtype)
+            continue
+        train_y_norm = (train_y_i - y_mean) / y_std
 
-        try:
-            # Нормальный цикл обучения (несколько итераций Adam)
-            for _step in range(200):          # при необходимости уменьшите/увеличьте число шагов
-                optimizer.zero_grad()
-                output = model(train_x_i)
-                loss = -mll(output, train_y_i)
-                if not torch.isfinite(loss):
-                    raise RuntimeError("Non-finite loss during GP training")
-                loss.backward()
-                optimizer.step()
-
-        except Exception as e:
-            # Ошибка при обучении GP — откатываем параметры и используем запасной план
-            warnings.warn(f"GP training failed for batch element {i}: {repr(e)}. Using Gaussian smoothing fallback.")
+        # Попытка обучить лёгкий GP (коротко)
+        use_gp = True
+        if use_gp:
             try:
-                model.load_state_dict(state_model_before)
-                likelihood.load_state_dict(state_lik_before)
-            except Exception:
-                # если откат невозможен — пропускаем
-                pass
+                likelihood = GaussianLikelihood().to(device=device, dtype=dtype)
+                model = FluxDriftGP(train_x_i.to(device=device, dtype=dtype),
+                                    train_y_norm.to(device=device, dtype=dtype),
+                                    likelihood).to(device=device, dtype=dtype)
 
-            # --- Запасной план: гауссово сглаживание (конволюция) ---
-            # Соберём полную кривую, но заменим точки в транзите на линейную интерполяцию из соседних
-            y_full = flux_t[i].clone().to(device=device, dtype=dtype)
+                # минимальная инициализация параметров для стабильности
+                try:
+                    for name, param in model.named_parameters():
+                        if "lengthscale" in name:
+                            param.data.clamp_(1e-3, 10.0)
+                        if "raw_outputscale" in name or "outputscale" in name:
+                            param.data.clamp_(1e-6, 10.0)
+                except Exception:
+                    pass
 
-            # Простое локальное гауссово сглаживание с kernel_radius (в пикселях)
-            kernel_radius = max(1, T // 100)   # регулируйте размер ядра
-            sigma = kernel_radius / 2.0
-            # формируем 1D Gaussian kernel
-            coords = torch.arange(-kernel_radius, kernel_radius+1, device=device, dtype=dtype)
-            gauss_kernel = torch.exp(-(coords**2) / (2 * sigma**2))
-            gauss_kernel = gauss_kernel / gauss_kernel.sum()
-            gauss_kernel = gauss_kernel.view(1, 1, -1)  # для F.conv1d
+                model.train()
+                likelihood.train()
 
-            # подготовка: [N=1, C=1, L=T]
-            y_pad = y_full.unsqueeze(0).unsqueeze(0)
-            # padding = kernel_radius на обе стороны
-            y_smooth = F.conv1d(F.pad(y_pad, (kernel_radius, kernel_radius), mode='reflect'), gauss_kernel)
-            y_smooth = y_smooth.view(-1)  # длина T
+                params = list(model.parameters()) + list(likelihood.parameters())
+                optimizer = torch.optim.Adam(params, lr=gp_lr)
+                mll = ExactMarginalLogLikelihood(likelihood, model)
 
-            # В зоне транзита возьмём сглаженное значение, вне транзита оставим оригинал
-            l, r = bounds[i]
-            li = int(max(0, np.floor(l)))
-            ri = int(min(T, np.ceil(r)))
-            if ri > li:
-                y_fallback = y_full.clone()
-                y_fallback[li:ri] = y_smooth[li:ri]
-            else:
-                y_fallback = y_smooth
+                converged = False
+                prev_loss = None
+                for _ in range(gp_max_iter):
+                    optimizer.zero_grad()
+                    output = model(train_x_i)
+                    loss = -mll(output, train_y_norm)
+                    if not torch.isfinite(loss):
+                        raise RuntimeError("Non-finite loss during GP training")
+                    loss.backward()
+                    optimizer.step()
 
-            # Записываем fallback в drift (получаем константу/предсказание)
-            # Чтобы сохранить семантику drift как "предсказанный тренд", используем y_fallback
-            drift[i, :] = y_fallback
+                    cur_loss = float(loss.item())
+                    if prev_loss is not None and abs(prev_loss - cur_loss) < 1e-6:
+                        converged = True
+                        break
+                    prev_loss = cur_loss
 
+                # Предсказание по всей временной оси
+                model.eval()
+                likelihood.eval()
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    test_x_i = x[i].reshape(-1, 1).to(device=device, dtype=dtype)
+                    pred = likelihood(model(test_x_i))
+                    mean_norm = pred.mean
+                    if torch.isnan(mean_norm).any() or torch.isinf(mean_norm).any():
+                        raise RuntimeError("Invalid GP mean")
+                    mean = mean_norm * y_std + y_mean
+                    drift[i, :] = mean
+
+            except Exception as e:
+                warnings.warn(f"GP training/prediction failed for batch element {i}: {repr(e)}. Using fallback smoothing.")
+                # fallback: адаптивное скользящее среднее
+                k = max(3, min(11, (T // 10) | 1))
+                drift[i, :] = rolling_avg_1d(flux_t[i], k)
         else:
-            # Если обучение прошло успешно — делаем предсказание
-            model.eval()
-            likelihood.eval()
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                test_x_i = x[i].reshape(-1, 1).to(device=device, dtype=dtype)
-                observed_pred = likelihood(model(test_x_i))
-                pred_mean = observed_pred.mean
-                drift[i, :] = pred_mean
-    
-    # Нормализуем drift
+            # без GP — просто fallback
+            k = max(3, min(11, (T // 10) | 1))
+            drift[i, :] = rolling_avg_1d(flux_t[i], k)
+
+    # Нормализация drift -> drift_ratio
     means = drift.mean(dim=1, keepdim=True)
     eps = torch.finfo(dtype).eps
     means = torch.where(means.abs() < eps, torch.full_like(means, eps), means)
