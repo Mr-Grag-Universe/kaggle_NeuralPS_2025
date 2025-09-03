@@ -56,12 +56,14 @@ class PlanetDataset(Dataset):
         signal = self.get_signal(observation)
         try:
             labels = self.get_labels_for_planet(observation['planet_id'])
+            noise = get_noise(signal, labels[1:])
         except ValueError:
             labels = None
+            noise = None
         
         return {
             'signal': signal,
-            'noise' : get_noise(signal, labels[1:]),
+            'noise' : noise,
             'noisy_target' : get_target(signal),
             'target': labels,
 
