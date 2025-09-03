@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .process_data import *
+
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -303,3 +305,17 @@ class UNet3LevelWithFeatures(nn.Module):
 
         out = self.final_conv(d1)
         return out
+
+def psnr_loss(pred, target, data_range=1.0, eps=1e-8):
+    mse = torch.mean((pred - target) ** 2)
+    psnr = 10.0 * torch.log10((data_range ** 2) / (mse + eps))
+    return -psnr
+
+def my_body_batch_fn(batch):
+    cds_signals = batch['signal']                     # [B,112,16,356]
+    inputs = cds_signals.permute(0, 2, 1, 3)          # пример трансформации
+    targets = batch['target'][:,1:]
+    noise = get_noise(cds_signals, targets)
+    targets = inputs.mean(-3) - noise         # если нужно
+    det_array = get_target(batch['signal'])
+    return inputs, targets, det_array
